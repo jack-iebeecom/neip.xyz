@@ -75,6 +75,24 @@ const pingSchema = Joi.object({
   count: Joi.number().integer().min(1).max(10).default(4)
 });
 
+// tracert 입력 검증 스키마
+const tracertSchema = Joi.object({
+  host: Joi.string()
+    .min(1)
+    .max(253)
+    .required()
+    .custom((value, helpers) => {
+      const ipRegex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+      const domainRegex = /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+      
+      if (!ipRegex.test(value) && !domainRegex.test(value)) {
+        return helpers.error('string.invalid');
+      }
+      return value;
+    }, 'IP address or domain validation'),
+  maxHops: Joi.number().integer().min(1).max(30).default(30)
+});
+
 // OS 감지 함수
 function getOS() {
   const platform = process.platform;
@@ -104,6 +122,34 @@ function buildPingCommand(host, count) {
       return {
         command: 'ping',
         args: ['-c', count.toString(), host],
+        options: { env: { ...process.env, LC_ALL: 'C' } }
+      };
+    default:
+      throw new Error('Unsupported operating system');
+  }
+}
+
+// tracert 명령어 구성 함수
+function buildTracertCommand(host, maxHops) {
+  const os = getOS();
+  
+  switch (os) {
+    case 'windows':
+      return {
+        command: 'cmd',
+        args: ['/c', `chcp 65001 >nul && tracert -h ${maxHops} ${host}`],
+        options: { env: { ...process.env, LANG: 'en_US.UTF-8' } }
+      };
+    case 'macos':
+      return {
+        command: 'traceroute',
+        args: ['-m', maxHops.toString(), host],
+        options: { env: { ...process.env, LC_ALL: 'C' } }
+      };
+    case 'linux':
+      return {
+        command: 'traceroute',
+        args: ['-m', maxHops.toString(), host],
         options: { env: { ...process.env, LC_ALL: 'C' } }
       };
     default:
@@ -162,6 +208,74 @@ function cleanPingOutput(text) {
     if (times) {
       return `round-trip min/avg/max = ${times[1]}/${times[2]}/${times[3]} ms`;
     }
+  }
+
+  return cleaned.length > 5 ? cleaned : '';
+}
+
+// tracert 출력 정리 함수
+function cleanTracertOutput(text) {
+  let cleaned = text
+    .replace(/[♦◊�]/g, ' ')
+    .replace(/[^\x00-\x7F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Windows tracert 출력 처리
+  if (cleaned.includes('ms') && cleaned.match(/^\s*\d+/)) {
+    // "1    <1 ms    <1 ms    <1 ms  192.168.1.1" 형태
+    const hopMatch = cleaned.match(/^\s*(\d+)\s+(.+)/);
+    if (hopMatch) {
+      const hopNum = hopMatch[1];
+      const hopData = hopMatch[2].trim();
+      return `${hopNum.padStart(2)} ${hopData}`;
+    }
+  }
+
+  // Linux/Mac traceroute 출력 처리
+  if (cleaned.includes('traceroute to')) {
+    // "traceroute to google.com (172.217.175.14), 30 hops max"
+    const hostMatch = cleaned.match(/traceroute to ([^\s]+)/);
+    if (hostMatch) {
+      return `Tracing route to ${hostMatch[1]}`;
+    }
+  }
+
+  // 홉 정보 처리
+  if (cleaned.match(/^\s*\d+\s+/)) {
+    // Linux/Mac: "1  192.168.1.1 (192.168.1.1)  0.123 ms  0.456 ms  0.789 ms"
+    const hopMatch = cleaned.match(/^\s*(\d+)\s+(.+)/);
+    if (hopMatch) {
+      const hopNum = hopMatch[1];
+      let hopInfo = hopMatch[2].trim();
+      
+      // IP 주소와 시간 정보 정리
+      const ipMatch = hopInfo.match(/(\d+\.\d+\.\d+\.\d+)/);
+      const timeMatches = hopInfo.match(/([0-9.]+)\s*ms/g);
+      
+      if (ipMatch && timeMatches) {
+        const ip = ipMatch[1];
+        const avgTime = timeMatches.length > 0 ? timeMatches[0] : 'N/A';
+        return `${hopNum.padStart(2)}   ${avgTime.padEnd(8)} ${ip}`;
+      }
+    }
+  }
+
+  // 타임아웃 처리
+  if (cleaned.includes('*') || cleaned.includes('timeout') || cleaned.includes('Request timed out')) {
+    const hopMatch = cleaned.match(/^\s*(\d+)/);
+    if (hopMatch) {
+      return `${hopMatch[1].padStart(2)}   * * *     Request timed out`;
+    }
+  }
+
+  // 에러 메시지
+  if (cleaned.includes('could not resolve') || cleaned.includes('unknown host') || cleaned.includes('Name or service not known')) {
+    return 'Error: Unable to resolve target host name';
+  }
+
+  if (cleaned.includes('Network is unreachable') || cleaned.includes('Destination host unreachable')) {
+    return 'Error: Network is unreachable';
   }
 
   return cleaned.length > 5 ? cleaned : '';
@@ -333,6 +447,144 @@ app.post('/api/ping', authenticateApiKey, async (req, res) => {
 
   } catch (error) {
     log('error', 'API error', { error: error.message, ip: req.ip });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+});
+
+// Tracert API 엔드포인트
+app.post('/api/tracert', authenticateApiKey, async (req, res) => {
+  try {
+    // 입력 검증
+    const { error, value } = tracertSchema.validate(req.body);
+    if (error) {
+      log('warn', 'Invalid tracert input', { error: error.details, ip: req.ip });
+      return res.status(400).json({
+        error: 'Invalid input',
+        details: error.details.map(d => ({ field: d.path.join('.'), message: d.message }))
+      });
+    }
+
+    const { host, maxHops } = value;
+    
+    log('info', 'Tracert test started', { host, maxHops, ip: req.ip, server: SERVER_NAME });
+
+    // SSE 헤더 설정
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': req.headers.origin || '*',
+      'Access-Control-Allow-Credentials': 'true'
+    });
+
+    // 시작 메시지 전송
+    const startMessage = `data: ${JSON.stringify({
+      type: 'start',
+      message: `TRACERT ${host} from ${SERVER_NAME} - Starting traceroute with max ${maxHops} hops...`,
+      timestamp: new Date().toISOString(),
+      server: SERVER_NAME
+    })}\n\n`;
+    res.write(startMessage);
+
+    try {
+      const { command, args, options } = buildTracertCommand(host, maxHops);
+      const tracertProcess = spawn(command, args, options);
+
+      // UTF-8 인코딩 설정
+      if (tracertProcess.stdout) {
+        tracertProcess.stdout.setEncoding('utf8');
+      }
+      if (tracertProcess.stderr) {
+        tracertProcess.stderr.setEncoding('utf8');
+      }
+
+      // stdout 데이터 처리
+      tracertProcess.stdout?.on('data', (data) => {
+        const output = data.toString().trim();
+        if (output) {
+          const lines = output.split('\n');
+          lines.forEach((line) => {
+            if (line.trim()) {
+              const cleanedLine = cleanTracertOutput(line.trim());
+              if (cleanedLine) {
+                const message = `data: ${JSON.stringify({
+                  type: 'output',
+                  message: cleanedLine,
+                  timestamp: new Date().toISOString(),
+                  server: SERVER_NAME
+                })}\n\n`;
+                res.write(message);
+              }
+            }
+          });
+        }
+      });
+
+      // stderr 데이터 처리
+      tracertProcess.stderr?.on('data', (data) => {
+        const error = data.toString().trim();
+        if (error) {
+          log('error', 'Tracert stderr', { error, host, server: SERVER_NAME });
+          const cleanedError = cleanTracertOutput(error);
+          const message = `data: ${JSON.stringify({
+            type: 'error',
+            message: cleanedError || error,
+            timestamp: new Date().toISOString(),
+            server: SERVER_NAME
+          })}\n\n`;
+          res.write(message);
+        }
+      });
+
+      // 프로세스 종료 처리
+      tracertProcess.on('close', (code) => {
+        log('info', 'Tracert test completed', { host, code, server: SERVER_NAME });
+        const message = `data: ${JSON.stringify({
+          type: 'complete',
+          message: `Traceroute completed with exit code ${code}`,
+          success: code === 0,
+          timestamp: new Date().toISOString(),
+          server: SERVER_NAME
+        })}\n\n`;
+        res.write(message);
+        res.end();
+      });
+
+      // 에러 처리
+      tracertProcess.on('error', (error) => {
+        log('error', 'Tracert process error', { error: error.message, host, server: SERVER_NAME });
+        const message = `data: ${JSON.stringify({
+          type: 'error',
+          message: `Failed to execute traceroute: ${error.message}`,
+          timestamp: new Date().toISOString(),
+          server: SERVER_NAME
+        })}\n\n`;
+        res.write(message);
+        res.end();
+      });
+
+      // 클라이언트 연결 끊김 처리
+      req.on('close', () => {
+        log('info', 'Tracert client disconnected', { host, server: SERVER_NAME });
+        tracertProcess.kill();
+      });
+
+    } catch (error) {
+      log('error', 'Tracert execution error', { error: error.message, host, server: SERVER_NAME });
+      const message = `data: ${JSON.stringify({
+        type: 'error',
+        message: error.message,
+        timestamp: new Date().toISOString(),
+        server: SERVER_NAME
+      })}\n\n`;
+      res.write(message);
+      res.end();
+    }
+
+  } catch (error) {
+    log('error', 'Tracert API error', { error: error.message, ip: req.ip });
     if (!res.headersSent) {
       res.status(500).json({ error: 'Internal server error' });
     }
