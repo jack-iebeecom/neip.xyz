@@ -29,10 +29,15 @@ print_error() {
     echo -e "${RED}❌ $1${NC}"
 }
 
-# 현재 사용자가 root가 아닌지 확인
-if [ "$EUID" -eq 0 ]; then
-    print_error "이 스크립트는 root 권한으로 실행하지 마세요."
-    exit 1
+# Root 권한 확인 (필요한 경우)
+if [ "$EUID" -ne 0 ]; then
+    print_warning "이 스크립트는 root 권한으로 실행하는 것을 권장합니다."
+    print_warning "sudo ./update-server.sh 로 실행하세요."
+    read -p "계속하시겠습니까? (y/N): " confirm
+    if [[ ! $confirm =~ ^[Yy]$ ]]; then
+        echo "업데이트가 취소되었습니다."
+        exit 1
+    fi
 fi
 
 echo -e "${BLUE}"
@@ -71,8 +76,8 @@ print_success "백업 완료: $BACKUP_DIR"
 print_step "3단계: traceroute 패키지 설치 확인 중..."
 if ! command -v traceroute &> /dev/null; then
     print_warning "traceroute가 설치되지 않았습니다. 설치 중..."
-    sudo apt update -y >/dev/null 2>&1
-    sudo apt install -y traceroute >/dev/null 2>&1
+    apt update -y >/dev/null 2>&1
+    apt install -y traceroute >/dev/null 2>&1
     print_success "traceroute 설치 완료"
 else
     print_success "traceroute가 이미 설치되어 있습니다"
